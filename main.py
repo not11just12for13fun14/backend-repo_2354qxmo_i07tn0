@@ -2,22 +2,57 @@ import os
 from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from database import db, create_document, get_documents
 from schemas import Event, Alert
+import io
+import csv
 
-app = FastAPI(title="Insider Threat Detection API")
+app = FastAPI(title="Insider Threat Detection API", version="1.1.0")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"]
 )
+
+
+# ----------------------------
+# Security (simple API key)
+# ----------------------------
+API_KEY = os.getenv("API_KEY")
+
+
+def verify_api_key(x_api_key: Optional[str] = Header(default=None)):
+    if API_KEY:
+        if not x_api_key or x_api_key != API_KEY:
+            raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return True
+
+
+# ----------------------------
+# Startup: create indexes
+# ----------------------------
+@app.on_event("startup")
+def ensure_indexes():
+    if db is None:
+        return
+    try:
+        db.event.create_index("timestamp")
+        db.event.create_index("user")
+        db.event.create_index("action")
+        db.event.create_index("status")
+        db.event.create_index("source")
+        db.alert.create_index([("rule_id", 1), ("user", 1)])
+        db.alert.create_index("last_seen")
+    except Exception:
+        pass
 
 
 @app.get("/")
@@ -29,26 +64,46 @@ class IngestResponse(BaseModel):
     inserted_ids: List[str]
 
 
-@app.post("/api/events/ingest", response_model=IngestResponse)
+# ----------------------------
+# Ingest Events (bulk)
+# ----------------------------
+@app.post("/api/events/ingest", response_model=IngestResponse, dependencies=[Depends(verify_api_key)])
 async def ingest_events(events: List[Event]):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not configured")
 
-    inserted: List[str] = []
+    if not events:
+        return {"inserted_ids": []}
+
+    if len(events) > 10000:
+        raise HTTPException(status_code=413, detail="Too many events in one request (max 10,000)")
+
+    # Bulk insert for performance
+    docs = []
     for ev in events:
-        doc_id = create_document("event", ev)
-        inserted.append(doc_id)
+        d = ev.model_dump()
+        now = datetime.utcnow()
+        d["created_at"] = now
+        d["updated_at"] = now
+        docs.append(d)
+
+    result = db["event"].insert_many(docs)
+    inserted = [str(_id) for _id in result.inserted_ids]
     return {"inserted_ids": inserted}
 
 
-@app.get("/api/events")
+# ----------------------------
+# List Events with filters + pagination
+# ----------------------------
+@app.get("/api/events", dependencies=[Depends(verify_api_key)])
 async def list_events(
     user: Optional[str] = None,
     source: Optional[str] = None,
     action: Optional[str] = None,
     status: Optional[str] = None,
     since_minutes: int = Query(60 * 24, ge=1, le=60 * 24 * 30),
-    limit: int = Query(200, ge=1, le=2000),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=1000),
 ):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not configured")
@@ -64,21 +119,28 @@ async def list_events(
     if status:
         filter_q["status"] = status
 
-    docs = get_documents("event", filter_q, limit)
-    # Convert datetimes to isoformat for frontend
+    total = db.event.count_documents(filter_q)
+    skip = (page - 1) * page_size
+    cursor = db.event.find(filter_q).sort("timestamp", -1).skip(skip).limit(page_size)
+    docs = list(cursor)
+
     for d in docs:
         if isinstance(d.get("timestamp"), datetime):
             d["timestamp"] = d["timestamp"].isoformat()
         d["_id"] = str(d.get("_id"))
-    return {"items": docs}
+
+    return {"items": docs, "page": page, "page_size": page_size, "total": total}
 
 
-# Simple rule engine using stored events; no simulated data. It evaluates existing data.
-@app.get("/api/alerts/run", response_model=List[Alert])
+# ----------------------------
+# Detection engine
+# ----------------------------
+@app.get("/api/alerts/run", response_model=List[Alert], dependencies=[Depends(verify_api_key)])
 async def run_detections(
     window_minutes: int = Query(60 * 24, ge=5, le=60 * 24 * 7),
     threshold_failed_logins: int = Query(5, ge=2, le=50),
     threshold_large_downloads_mb: int = Query(500, ge=100, le=50000),
+    persist: bool = Query(False, description="Persist generated alerts to the database"),
 ):
     if db is None:
         raise HTTPException(status_code=500, detail="Database not configured")
@@ -109,7 +171,6 @@ async def run_detections(
         alerts.append(alert)
 
     # Rule 2: Large data transfer/download events
-    # Expect events with metadata.size_mb numeric
     download_cursor = db.event.aggregate([
         {"$match": {"timestamp": {"$gte": start_time}, "action": {"$in": ["download", "exfiltrate", "transfer"]}}},
         {"$project": {"user": 1, "timestamp": 1, "size_mb": {"$toDouble": "$metadata.size_mb"}}},
@@ -131,7 +192,7 @@ async def run_detections(
         )
         alerts.append(alert)
 
-    # Rule 3: Access outside business hours (8am-6pm) to sensitive resources
+    # Rule 3: After-hours access to sensitive resources
     sensitive_cursor = db.event.aggregate([
         {"$match": {"timestamp": {"$gte": start_time}, "action": {"$in": ["read", "write", "download"]}, "resource": {"$regex": r"/sensitive|/confidential|/restricted", "$options": "i"}}},
         {"$addFields": {"hour": {"$hour": "$timestamp"}}},
@@ -157,7 +218,114 @@ async def run_detections(
     sev_order = {"critical": 4, "high": 3, "medium": 2, "low": 1}
     alerts.sort(key=lambda a: (sev_order.get(a.severity, 0), a.count), reverse=True)
 
+    if persist:
+        for a in alerts:
+            create_document("alert", a)
+
     return alerts
+
+
+# ----------------------------
+# Persisted alerts: list + acknowledge
+# ----------------------------
+class AckRequest(BaseModel):
+    ids: List[str]
+
+
+@app.get("/api/alerts", dependencies=[Depends(verify_api_key)])
+async def list_alerts(user: Optional[str] = None, rule_id: Optional[str] = None, page: int = Query(1, ge=1), page_size: int = Query(50, ge=1, le=1000)):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    filt: Dict[str, Any] = {}
+    if user:
+        filt["user"] = user
+    if rule_id:
+        filt["rule_id"] = rule_id
+    total = db.alert.count_documents(filt)
+    skip = (page - 1) * page_size
+    items = list(db.alert.find(filt).sort("last_seen", -1).skip(skip).limit(page_size))
+    for d in items:
+        d["_id"] = str(d["_id"])
+        for k in ["first_seen", "last_seen"]:
+            if isinstance(d.get(k), datetime):
+                d[k] = d[k].isoformat()
+    return {"items": items, "total": total, "page": page, "page_size": page_size}
+
+
+@app.post("/api/alerts/ack", dependencies=[Depends(verify_api_key)])
+async def acknowledge_alerts(req: AckRequest):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+    from bson import ObjectId
+    acked = 0
+    for sid in req.ids:
+        try:
+            db.alert.update_one({"_id": ObjectId(sid)}, {"$set": {"acknowledged": True, "ack_time": datetime.utcnow()}})
+            acked += 1
+        except Exception:
+            pass
+    return {"acknowledged": acked}
+
+
+# ----------------------------
+# CSV export of events
+# ----------------------------
+@app.get("/api/export/events.csv", dependencies=[Depends(verify_api_key)])
+async def export_events_csv(
+    user: Optional[str] = None,
+    source: Optional[str] = None,
+    action: Optional[str] = None,
+    status: Optional[str] = None,
+    since_minutes: int = Query(60 * 24, ge=1, le=60 * 24 * 30),
+):
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database not configured")
+
+    earliest = datetime.utcnow() - timedelta(minutes=since_minutes)
+    filt: Dict[str, Any] = {"timestamp": {"$gte": earliest}}
+    if user:
+        filt["user"] = user
+    if source:
+        filt["source"] = source
+    if action:
+        filt["action"] = action
+    if status:
+        filt["status"] = status
+
+    cursor = db.event.find(filt).sort("timestamp", -1)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["timestamp", "user", "action", "status", "resource", "source", "ip", "device"])
+    for e in cursor:
+        ts = e.get("timestamp")
+        if isinstance(ts, datetime):
+            ts = ts.isoformat()
+        writer.writerow([
+            ts,
+            e.get("user", ""),
+            e.get("action", ""),
+            e.get("status", ""),
+            e.get("resource", ""),
+            e.get("source", ""),
+            e.get("ip", ""),
+            e.get("device", ""),
+        ])
+    output.seek(0)
+    return StreamingResponse(iter([output.getvalue()]), media_type="text/csv", headers={"Content-Disposition": "attachment; filename=events.csv"})
+
+
+# ----------------------------
+# Health/Readiness checks
+# ----------------------------
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz():
+    ready = db is not None
+    return {"status": "ready" if ready else "not_ready"}
 
 
 @app.get("/test")
